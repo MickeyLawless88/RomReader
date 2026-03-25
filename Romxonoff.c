@@ -808,6 +808,15 @@ int main(int argc, char *argv[]) {
         printf("Ready!\n\n");
         printf("Press any key to start reading from COM1...\n");
         getch();
+
+        /* Send 'R' command to trigger ROM dump from Model 9000 programmer */
+        textcolor(LIGHTCYAN);
+        printf("Sending R command to programmer...\n");
+        textcolor(LIGHTGRAY);
+        WriteCOM1('R');
+        WriteCOM1('\r');
+        delay(500);  /* Give programmer time to respond before we start reading */
+
         ReadDataFromCOM1();
         if (BufferSize == 0) {
             textcolor(LIGHTRED);
