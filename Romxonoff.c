@@ -46,6 +46,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <alloc.h>
+#include <bios.h>
 #include <conio.h>
 #include <dos.h>
 #include <string.h>
@@ -147,11 +148,17 @@ void ReadDataFromCOM1(void) {
     int hexPos = 0;
     unsigned char ch;
     unsigned int value;
-    long timeout = 0;
     int linePos = 0;
-    int bytesThisSecond = 0;
-    long lastByteTime = 0;
-    int xoffPaused = 0;  /* XON/XOFF flow control state */
+    int xoffPaused = 0;       /* XON/XOFF flow control state */
+    long lastByteTime;        /* BIOS tick count when last byte arrived */
+    long currentTime;
+    long waitingNotified = 0; /* Have we shown the "waiting" message yet */
+
+    /* BIOS tick rate is ~18.2 ticks/sec.
+       3 seconds = ~55 ticks. Used for end-of-transmission detection.
+       5 seconds = ~91 ticks. Used for initial "waiting" timeout.       */
+    #define TICKS_3SEC  55L
+    #define TICKS_5SEC  91L
 
     hexStr[0] = 0; hexStr[1] = 0; hexStr[2] = 0;
     BufferSize = 0;
@@ -165,6 +172,9 @@ void ReadDataFromCOM1(void) {
     printf("Press ESC to stop reading\n");
     printf("========================================================================\n");
 
+    /* Record start time using BIOS tick counter */
+    lastByteTime = biostime(0, 0L);
+
     while (BufferSize < MAX_BUFFER_SIZE) {
         if (kbhit()) {
             if (getch() == 27) {
@@ -175,17 +185,21 @@ void ReadDataFromCOM1(void) {
                 break;
             }
         }
+
         if (COM1DataReady()) {
             ch = ReadCOM1();
-            timeout = 0;
-            lastByteTime = 0;
+            lastByteTime = biostime(0, 0L);  /* Reset timer on any received byte */
+            waitingNotified = 0;
 
-            /* XON/XOFF flow control - handle before any other processing */
+            /* XON/XOFF flow control - handle before any other processing.
+               Reset hexPos so a control byte mid-pair doesn't corrupt next byte. */
             if (ch == 0x13) {        /* XOFF (Ctrl-S) - programmer buffer filling up */
                 xoffPaused = 1;
+                hexPos = 0;
                 continue;
             } else if (ch == 0x11) { /* XON  (Ctrl-Q) - programmer buffer drained, resume */
                 xoffPaused = 0;
+                hexPos = 0;
                 continue;
             }
 
@@ -200,29 +214,34 @@ void ReadDataFromCOM1(void) {
                     hexPos = 0;
                     printf("%02X ", (unsigned char)value);
                     linePos++;
-                    bytesThisSecond++;
                     if (linePos >= 16) { printf("\n"); linePos = 0; }
-                    /* Removed delay(2) - was causing receive buffer overruns at 9600 baud */
                 }
             } else if (ch == ' ' || ch == '\r' || ch == '\n' || ch == '\t') {
-                hexPos = 0;
+                hexPos = 0;  /* Whitespace resets hex pair accumulator */
             }
         } else {
-            timeout++;
-            lastByteTime++;
-            if (timeout % 500 == 0) delay(5);
-            if (timeout > 600000L && BufferSize > 0) {
+            /* No data available - check real-time elapsed since last byte */
+            currentTime = biostime(0, 0L);
+
+            /* End-of-transmission: 3 real seconds of silence after receiving data */
+            if (BufferSize > 0 && (currentTime - lastByteTime) > TICKS_3SEC) {
                 printf("\n");
                 textcolor(LIGHTGREEN);
                 printf("Transmission complete. Total bytes: %lu\n", BufferSize);
                 textcolor(LIGHTGRAY);
                 break;
             }
-            if (BufferSize == 0 && timeout > 50000L && (timeout % 50000L) == 0) {
+
+            /* Show waiting message if no data received within 5 seconds of start */
+            if (BufferSize == 0 && !waitingNotified &&
+                (currentTime - lastByteTime) > TICKS_5SEC) {
                 textcolor(YELLOW);
                 printf("Waiting for data from COM1...\n");
                 textcolor(LIGHTGRAY);
+                waitingNotified = 1;
             }
+
+            delay(1);  /* Yield a millisecond to avoid hammering the CPU */
         }
     }
 
