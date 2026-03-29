@@ -155,7 +155,6 @@ void ReadDataFromCOM1(void) {
     int ch;
     unsigned int value;
     int linePos;
-    int shownWaiting;
     unsigned long expectedSize;
     unsigned long lastPrintSize;
     long idleCount;
@@ -198,7 +197,6 @@ void ReadDataFromCOM1(void) {
     hexStr[0] = 0; hexStr[1] = 0; hexStr[2] = 0;
     hexPos      = 0;
     linePos     = 0;
-    shownWaiting = 0;
     lastPrintSize = 0;
     idleCount   = 0;
     BufferSize  = 0;
@@ -207,37 +205,116 @@ void ReadDataFromCOM1(void) {
     printf("Press ESC to abort\n");
     printf("========================================================================\n");
 
+    /* Auto-detecting line parser.
+       Handles both formats transparently:
+         Listing: AAAA  DD DD DD DD ...  (Bytek/GTEK)
+         Raw hex: DD DD DD DD ...        (plain space-separated)
+
+       Detection: if the first token on a line is exactly 4 hex chars
+       followed by 2+ spaces, it is an address - skip it.
+       Otherwise treat all hex pairs as data.
+
+       lineState:
+         0 = start of line, collecting first token to decide format
+         1 = first token was address - skip trailing spaces then read data
+         2 = reading data bytes
+    */
+    {
+        int lineState = 0;
+        int tokenLen = 0;        /* length of first token on line */
+        int spaceCount = 0;      /* spaces seen after first token */
+
     while (BufferSize < MAX_BUFFER_SIZE) {
 
         /* --- drain every byte currently in the UART --- */
         while (inportb(COM1_LSR) & 0x01) {
             ch = inportb(COM1_DATA);
             idleCount = 0;
-            shownWaiting = 0;
 
-            if ((ch >= '0' && ch <= '9') ||
-                (ch >= 'A' && ch <= 'F') ||
-                (ch >= 'a' && ch <= 'f')) {
-                hexStr[hexPos++] = (char)ch;
-                if (hexPos == 2) {
-                    /* Direct nibble math - no sscanf overhead */
-                    {
+            /* End of line - reset state */
+            if (ch == '\r' || ch == '\n') {
+                lineState = 0;
+                tokenLen = 0;
+                spaceCount = 0;
+                hexPos = 0;
+                continue;
+            }
+
+            if (lineState == 0) {
+                /* Collecting first token on line to detect address vs data */
+                int isHex = ((ch >= '0' && ch <= '9') ||
+                             (ch >= 'A' && ch <= 'F') ||
+                             (ch >= 'a' && ch <= 'f'));
+
+                if (isHex && tokenLen < 7) {
+                    tokenLen++;
+                    /* Also feed into hexStr in case this turns out to be data */
+                    if (hexPos < 2)
+                        hexStr[hexPos++] = (char)ch;
+                } else if (ch == ' ' || ch == '\t') {
+                    /* Space ends the first token */
+                    spaceCount++;
+                    if (tokenLen == 4 && spaceCount >= 2) {
+                        /* 4 hex chars + 2 spaces = address field, skip it */
+                        lineState = 1;
+                        hexPos = 0;
+                    } else if (tokenLen == 2 && spaceCount >= 1) {
+                        /* 2 hex chars + space = this was a data byte, store it */
+                        if (hexPos == 2) {
+                            unsigned char hi = (unsigned char)hexStr[0];
+                            unsigned char lo = (unsigned char)hexStr[1];
+                            hi = (hi >= 'a') ? (hi-'a'+10) :
+                                 (hi >= 'A') ? (hi-'A'+10) : (hi-'0');
+                            lo = (lo >= 'a') ? (lo-'a'+10) :
+                                 (lo >= 'A') ? (lo-'A'+10) : (lo-'0');
+                            DataBuffer[BufferSize++] = (hi << 4) | lo;
+                            if (expectedSize > 0 && BufferSize >= expectedSize)
+                                break;
+                        }
+                        hexPos = 0;
+                        lineState = 2;
+                    } else if (tokenLen > 0 && tokenLen != 4) {
+                        /* odd length token - treat as data line */
+                        lineState = 2;
+                    }
+                    /* if tokenLen==4 but only 1 space so far, keep waiting */
+                } else if (!isHex) {
+                    /* non-hex char on line start - skip to data mode */
+                    lineState = 2;
+                    hexPos = 0;
+                }
+                continue;
+            }
+
+            if (lineState == 1) {
+                /* Address was detected and skipped - now read data bytes */
+                /* Fall through to lineState 2 handling below */
+                lineState = 2;
+            }
+
+            if (lineState == 2) {
+                /* Reading data hex pairs */
+                if ((ch >= '0' && ch <= '9') ||
+                    (ch >= 'A' && ch <= 'F') ||
+                    (ch >= 'a' && ch <= 'f')) {
+                    hexStr[hexPos++] = (char)ch;
+                    if (hexPos == 2) {
                         unsigned char hi = (unsigned char)hexStr[0];
                         unsigned char lo = (unsigned char)hexStr[1];
-                        hi = (hi >= 'a') ? (hi - 'a' + 10) :
-                             (hi >= 'A') ? (hi - 'A' + 10) : (hi - '0');
-                        lo = (lo >= 'a') ? (lo - 'a' + 10) :
-                             (lo >= 'A') ? (lo - 'A' + 10) : (lo - '0');
+                        hi = (hi >= 'a') ? (hi-'a'+10) :
+                             (hi >= 'A') ? (hi-'A'+10) : (hi-'0');
+                        lo = (lo >= 'a') ? (lo-'a'+10) :
+                             (lo >= 'A') ? (lo-'A'+10) : (lo-'0');
                         DataBuffer[BufferSize++] = (hi << 4) | lo;
+                        hexPos = 0;
+                        if (expectedSize > 0 && BufferSize >= expectedSize)
+                            break;
                     }
+                } else if (ch == ' ' || ch == '\t') {
                     hexPos = 0;
-                    if (expectedSize > 0 && BufferSize >= expectedSize)
-                        break;
                 }
-            } else if (ch == ' ' || ch == '\r' || ch == '\n' || ch == '\t') {
-                hexPos = 0;
             }
-        }
+        } /* end inner UART drain while */
 
         /* --- stop immediately if we have all expected bytes --- */
         if (expectedSize > 0 && BufferSize >= expectedSize) {
@@ -273,8 +350,7 @@ void ReadDataFromCOM1(void) {
         /* --- idle tracking --- */
         if (!(inportb(COM1_LSR) & 0x01)) {
             idleCount++;
-            if (idleCount % 200 == 0)
-                delay(1);
+            if (idleCount % 200 == 0) delay(1);
 
             if (BufferSize < 64 && idleCount > 36000L && idleCount % 36000L == 0) {
                 textcolor(YELLOW);
@@ -282,9 +358,7 @@ void ReadDataFromCOM1(void) {
                 textcolor(LIGHTGRAY);
             }
 
-            /* timeout: only fire if we have received a meaningful amount
-               of data - at least 64 bytes, or half of expected size.
-               This prevents 6 garbage bytes from triggering a false done. */
+            /* timeout only after meaningful data received */
             {
                 unsigned long threshold;
                 if (expectedSize > 0)
@@ -300,7 +374,9 @@ void ReadDataFromCOM1(void) {
                 }
             }
         }
-    }
+
+    } /* end outer while */
+    } /* end lineState block */
 
     /* flush any remaining bytes to screen */
     if (BufferSize > lastPrintSize) {
@@ -388,7 +464,7 @@ void SaveBufferToFile(void) {
 void SaveBufferAsHex(void) {
     char filename[80];
     FILE *fp;
-    unsigned int i, addr, checksum, bytesInLine;
+    unsigned int i;
     int yPos = 23;
 
     gotoxy(1, yPos);
@@ -415,18 +491,23 @@ void SaveBufferAsHex(void) {
         getch(); return;
     }
 
-    addr = 0;
-    while (addr < BufferSize) {
-        bytesInLine = (BufferSize - addr >= 16) ? 16 : (BufferSize - addr);
-        checksum = bytesInLine + ((addr >> 8) & 0xFF) + (addr & 0xFF);
-        fprintf(fp, ":%02X%04X00", bytesInLine, addr);
-        for (i = 0; i < bytesInLine; i++) {
-            fprintf(fp, "%02X", DataBuffer[addr + i]);
-            checksum += DataBuffer[addr + i];
+    {
+        unsigned long laddr = 0;
+        unsigned int bline, cs, j;
+        unsigned char b;
+        while (laddr < BufferSize) {
+            bline = (BufferSize - laddr >= 16) ? 16 : (unsigned int)(BufferSize - laddr);
+            cs = bline + ((laddr >> 8) & 0xFF) + (laddr & 0xFF);
+            fprintf(fp, ":%02X%04lX00", bline, laddr);
+            for (j = 0; j < bline; j++) {
+                b = DataBuffer[laddr + j];
+                fprintf(fp, "%02X", b);
+                cs += b;
+            }
+            cs = (~cs + 1) & 0xFF;
+            fprintf(fp, "%02X\n", cs);
+            laddr += bline;
         }
-        checksum = (~checksum + 1) & 0xFF;
-        fprintf(fp, "%02X\n", checksum);
-        addr += bytesInLine;
     }
     fprintf(fp, ":00000001FF\n");
     fclose(fp);
@@ -1115,7 +1196,7 @@ void UploadToEPROM(void) {
     addr = 0;
 
     if (isBinary) {
-        while (!feof(fp) && addr < MAX_BUFFER_SIZE) {
+        while (!feof(fp) && addr < 0xFFFFU) {
             if (kbhit() && getch() == 27) {
                 textcolor(LIGHTRED); printf("\nUpload cancelled by user!\n"); textcolor(LIGHTGRAY);
                 fclose(fp); if (listFp) fclose(listFp); delay(1000); return;
@@ -1140,7 +1221,7 @@ void UploadToEPROM(void) {
                     }
                     fprintf(listFp, "%02X ", byte);
                 }
-                if (addr < MAX_BUFFER_SIZE) DataBuffer[addr] = byte;
+                DataBuffer[addr] = byte;
                 addr++;
                 delay(10);
             }
@@ -1151,7 +1232,7 @@ void UploadToEPROM(void) {
         unsigned int value;
         hexStr[0] = 0; hexStr[1] = 0; hexStr[2] = 0;
 
-        while (!feof(fp) && addr < MAX_BUFFER_SIZE) {
+        while (!feof(fp) && addr < 0xFFFFU) {
             if (kbhit() && getch() == 27) {
                 textcolor(LIGHTRED); printf("\nUpload cancelled by user!\n"); textcolor(LIGHTGRAY);
                 fclose(fp); if (listFp) fclose(listFp); delay(1000); return;
@@ -1182,7 +1263,7 @@ void UploadToEPROM(void) {
                         }
                         fprintf(listFp, "%02X ", byte);
                     }
-                    if (addr < MAX_BUFFER_SIZE) DataBuffer[addr] = byte;
+                    DataBuffer[addr] = byte;
                     addr++;
                 }
             } else if (ch == ' ' || ch == '\r' || ch == '\n' || ch == '\t') {
