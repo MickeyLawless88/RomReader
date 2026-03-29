@@ -697,7 +697,7 @@ void DisplayHexEditor(void) {
     int row, col;
     unsigned int addr;
     unsigned char byte;
-    int maxLines = 21;
+    int maxLines = 19;
     const char *modeStr;
     int cursorCol;
 
@@ -780,7 +780,7 @@ void DisplayHexEditor(void) {
 
 void HexEditor(void) {
     int key;
-    int maxLines = 21;
+    int maxLines = 19;
     int cursorCol;
 
     DisplayHexEditor();
